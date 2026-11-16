@@ -9,8 +9,8 @@ Close the Arduino Serial Monitor first (only one program can use the port).
 Left side : motor controls, voltage measurement settings, status log.
 Right side: live plot (voltage from the Keithley 2182A, optionally the
             output current of the Keithley 6221 in a second plot).
-Each measurement is also saved to a CSV file (measurement_YYYYMMDD_HHMMSS.csv)
-in the folder you run the script from.
+If "Save data to CSV file" is ticked, each measurement is saved to a CSV file
+(measurement_YYYYMMDD_HHMMSS.csv) in the folder you run the script from.
 
 The motor and the voltage measurement are independent: you can use either
 one alone, or both at the same time.
@@ -136,6 +136,12 @@ class App:
         ttk.Label(r4, text="Interval (s):").pack(side="left")
         self.interval_var = tk.StringVar(value=str(DEFAULT_INTERVAL))
         ttk.Entry(r4, textvariable=self.interval_var, width=10).pack(side="left", padx=6)
+
+        r5 = ttk.Frame(volt)
+        r5.pack(fill="x", **pad)
+        self.save_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(r5, text="Save data to CSV file",
+                        variable=self.save_var).pack(side="left")
 
         self.meas_btn = ttk.Button(volt, text="Start measurement",
                                    command=self.toggle_measure)
@@ -370,11 +376,17 @@ class App:
         self.times, self.voltages, self.currents = [], [], []
         self.setup_axes(with_6221)
 
-        filename = datetime.now().strftime("measurement_%Y%m%d_%H%M%S.csv")
+        if self.save_var.get():
+            filename = datetime.now().strftime("measurement_%Y%m%d_%H%M%S.csv")
+        else:
+            filename = None              # None = do not save
         self.meas_stop.clear()
         self.measuring = True
         self.meas_btn.config(text="Stop measurement")
-        self.log(f"Measurement started -> {filename}")
+        if filename:
+            self.log(f"Measurement started -> {filename}")
+        else:
+            self.log("Measurement started (not saving data).")
         threading.Thread(target=self.measure_worker,
                          args=(addr_v, addr_c, with_6221, interval, filename),
                          daemon=True).start()
@@ -400,12 +412,14 @@ class App:
 
             nano.write(':SENS:FUNC "VOLT"')
 
-            csv_file = open(filename, "w", newline="")
-            writer = csv.writer(csv_file)
-            headers = ["Time (s)", "Voltage (V)", "Voltage (uV)"]
-            if with_6221:
-                headers += ["Current (A)", "Current (uA)"]
-            writer.writerow(headers)
+            writer = None
+            if filename:
+                csv_file = open(filename, "w", newline="")
+                writer = csv.writer(csv_file)
+                headers = ["Time (s)", "Voltage (V)", "Voltage (uV)"]
+                if with_6221:
+                    headers += ["Current (A)", "Current (uA)"]
+                writer.writerow(headers)
 
             start = time.perf_counter()
             while not self.meas_stop.is_set():
@@ -419,8 +433,9 @@ class App:
                     current_ua = current * 1e6
                     row += [current, current_ua]
 
-                writer.writerow(row)
-                csv_file.flush()
+                if writer:
+                    writer.writerow(row)
+                    csv_file.flush()
                 self.mq.put(("data", elapsed, voltage * 1e6, current_ua))
 
                 # wait for the next reading, but wake up immediately on stop
@@ -435,7 +450,7 @@ class App:
                         obj.close()
                 except Exception:
                     pass
-            self.mq.put(("done", filename))
+            self.mq.put(("done", filename if csv_file else None))
 
     # ---------- GUI update loop ----------
     def poll_queue(self):
@@ -468,7 +483,10 @@ class App:
                 elif kind == "done":
                     self.measuring = False
                     self.meas_btn.config(text="Start measurement", state="normal")
-                    self.log(f"Measurement stopped. Data saved to: {msg[1]}")
+                    if msg[1]:
+                        self.log(f"Measurement stopped. Data saved to: {msg[1]}")
+                    else:
+                        self.log("Measurement stopped. Data was not saved.")
         except queue.Empty:
             pass
 

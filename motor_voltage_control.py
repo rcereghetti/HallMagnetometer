@@ -201,7 +201,43 @@ class App:
         self.root.after(2000, self.finish_connect)
 
     def finish_connect(self):
+        """The port opened, but that doesn't prove an Arduino is on it:
+        ask it something and only say 'Connected' if it answers."""
         self.ser.reset_input_buffer()
+        self.log("Checking that the Arduino answers...")
+        threading.Thread(target=self.handshake, args=(self.ser,),
+                         daemon=True).start()
+
+    def handshake(self, ser):
+        """Background check: send '?' and wait up to 2 s for BLOCKED/FREE."""
+        ok = False
+        try:
+            ser.write(b"?\n")
+            deadline = time.time() + 2.0
+            while time.time() < deadline:
+                line = ser.readline().decode(errors="ignore").strip()
+                if line in ("BLOCKED", "FREE"):
+                    ok = True
+                    break
+        except (serial.SerialException, OSError):
+            pass
+        self.q.put(("handshake", ok))
+
+    def handshake_done(self, ok):
+        if not ok:
+            port = self.port_var.get()
+            try:
+                self.ser.close()
+            except Exception:
+                pass
+            self.ser = None
+            self.conn_btn.config(text="Connect", state="normal")
+            self.log(f"No answer from the Arduino on {port}.")
+            messagebox.showerror(
+                "No Arduino found",
+                f"The port {port} opened, but nothing answered.\n\n"
+                "Wrong COM port, or the Arduino code is not running?")
+            return
         self.running = True
         threading.Thread(target=self.reader, daemon=True).start()
         self.conn_btn.config(text="Disconnect", state="normal")
@@ -406,7 +442,11 @@ class App:
         # motor messages
         try:
             while True:
-                self.log(self.q.get_nowait())
+                item = self.q.get_nowait()
+                if isinstance(item, tuple):          # ("handshake", ok)
+                    self.handshake_done(item[1])
+                else:
+                    self.log(item)
         except queue.Empty:
             pass
 

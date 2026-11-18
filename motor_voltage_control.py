@@ -8,7 +8,8 @@ Close the Arduino Serial Monitor first (only one program can use the port).
 Needs the matching Arduino sketch (motor_control.ino).
 
 Layout
-  left column   : motor jog buttons, optical sensor, status log
+  left column   : motor jog buttons, optical sensor, 6221 current source
+                  (connect / set current / output ON-OFF), status log
   middle column : sweep / stop-and-go program, voltage measurement
   right side    : top plot = voltage (optionally 6221 current),
                   bottom plot = optical sensor signal
@@ -60,6 +61,7 @@ SENSOR_WINDOW_S = 30         # seconds of sensor signal shown in the plot
 MIN_SPEED = 20               # steps per second (same limits as the Arduino)
 MAX_SPEED = 3000
 MAX_POS = 10_000_000
+MAX_CURRENT_UA = 105_000     # 6221 limit: 105 mA
 # --------------------------------------------------------
 
 
@@ -87,6 +89,13 @@ class App:
         self.measuring = False
         self.meas_stop = threading.Event()
         self.times, self.voltages, self.currents = [], [], []
+
+        # 6221 current source state (one shared GPIB session)
+        self.rm = None
+        self.source = None                  # pyvisa resource (None = not connected)
+        self.source_lock = threading.Lock() # only one GPIB conversation at a time
+        self.out_on = False
+        self.src_buttons = []
 
         # optical sensor state
         self.sensor_t = deque()
@@ -167,6 +176,39 @@ class App:
                              state="disabled")
         thr_btn.pack(side="left")
         self.buttons.append(thr_btn)
+
+        # =================== 6221 CURRENT SOURCE ===================
+        cur = ttk.LabelFrame(colA, text="Current source (Keithley 6221)")
+        cur.pack(fill="x", pady=(8, 0))
+
+        c1 = ttk.Frame(cur)
+        c1.pack(fill="x", **pad)
+        ttk.Label(c1, text="Address:").pack(side="left")
+        self.gpib_c_var = tk.StringVar(value=DEFAULT_GPIB_6221)
+        ttk.Entry(c1, textvariable=self.gpib_c_var, width=18).pack(side="left", padx=6)
+        self.src_conn_btn = ttk.Button(c1, text="Connect",
+                                       command=self.toggle_source_connect)
+        self.src_conn_btn.pack(side="left")
+
+        c2 = ttk.Frame(cur)
+        c2.pack(fill="x", **pad)
+        ttk.Label(c2, text="Current (uA):").pack(side="left")
+        self.cur_var = tk.StringVar(value="0")
+        cur_entry = ttk.Entry(c2, textvariable=self.cur_var, width=10)
+        cur_entry.pack(side="left", padx=6)
+        cur_entry.bind("<Return>", lambda e: self.set_source_current())
+        self.cur_set_btn = ttk.Button(c2, text="Set", state="disabled",
+                                      command=self.set_source_current)
+        self.cur_set_btn.pack(side="left")
+
+        c3 = ttk.Frame(cur)
+        c3.pack(fill="x", **pad)
+        self.out_label = ttk.Label(c3, text="Not connected")
+        self.out_label.pack(side="left")
+        self.out_btn = ttk.Button(c3, text="Turn ON", width=10, state="disabled",
+                                  command=self.toggle_source_output)
+        self.out_btn.pack(side="right")
+        self.src_buttons = [self.cur_set_btn, self.out_btn]
 
         # =================== STATUS ===================
         ttk.Label(colA, text="Status:").pack(anchor="w", pady=(8, 0))
@@ -249,14 +291,8 @@ class App:
         r2 = ttk.Frame(volt)
         r2.pack(fill="x", **pad)
         self.use_6221_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(r2, text="Also read 6221 current",
+        ttk.Checkbutton(r2, text="Also read 6221 current (connect it first)",
                         variable=self.use_6221_var).pack(side="left")
-
-        r3 = ttk.Frame(volt)
-        r3.pack(fill="x", **pad)
-        ttk.Label(r3, text="6221 address:").pack(side="left")
-        self.gpib_c_var = tk.StringVar(value=DEFAULT_GPIB_6221)
-        ttk.Entry(r3, textvariable=self.gpib_c_var, width=20).pack(side="left", padx=6)
 
         r4 = ttk.Frame(volt)
         r4.pack(fill="x", **pad)
@@ -289,6 +325,7 @@ class App:
 
         if pyvisa is None:
             self.meas_btn.config(state="disabled")
+            self.src_conn_btn.config(state="disabled")
             self.log("pyvisa is not installed: voltage measurement disabled.\n"
                      "Install it with: pip install pyvisa")
 
@@ -781,6 +818,126 @@ class App:
             self.ax2.autoscale_view()
         self.canvas.draw_idle()
 
+    # ---------- 6221 current source ----------
+    @staticmethod
+    def parse_on(text):
+        return text.strip().upper() in ("1", "ON")
+
+    def toggle_source_connect(self):
+        if self.source is not None:
+            if self.measuring:
+                messagebox.showwarning("Measurement running",
+                                       "Stop the measurement before disconnecting the 6221.")
+                return
+            self.source_disconnect()
+            return
+        addr = self.gpib_c_var.get().strip()
+        if not addr:
+            messagebox.showwarning("Missing address", "Enter the 6221 GPIB address.")
+            return
+        self.src_conn_btn.config(state="disabled")
+        self.log(f"Connecting to the 6221 at {addr}...")
+        threading.Thread(target=self.source_connect_worker, args=(addr,),
+                         daemon=True).start()
+
+    def source_connect_worker(self, addr):
+        """Opens the 6221 in the background (GPIB can be slow)."""
+        try:
+            if self.rm is None:
+                self.rm = pyvisa.ResourceManager()
+            src = self.rm.open_resource(addr)
+            src.timeout = 5000
+            src.read_termination = "\n"
+            src.write_termination = "\n"
+            idn = src.query("*IDN?").strip()
+            amps = float(src.query(":SOUR:CURR?"))
+            on = self.parse_on(src.query(":OUTP?"))
+            self.source = src
+            self.q.put(("src_connected", idn, amps, on))
+        except Exception as e:
+            self.q.put(("src_failed", f"6221 connection error: {e}"))
+
+    def source_disconnect(self):
+        """Closes the connection. The output is left as it is (ON stays ON)."""
+        with self.source_lock:
+            try:
+                self.source.close()
+            except Exception:
+                pass
+            self.source = None
+        self.out_on = False
+        for b in self.src_buttons:
+            b.config(state="disabled")
+        self.src_conn_btn.config(text="Connect", state="normal")
+        self.out_label.config(text="Not connected", foreground="")
+        self.log("6221 disconnected.")
+
+    def set_source_current(self):
+        if self.source is None:
+            return
+        try:
+            ua = float(self.cur_var.get())
+        except ValueError:
+            messagebox.showwarning("Bad current", "Enter the current in uA (e.g. 100).")
+            return
+        if abs(ua) > MAX_CURRENT_UA:
+            messagebox.showwarning(
+                "Bad current",
+                f"The 6221 can give at most +/-{MAX_CURRENT_UA:g} uA (105 mA).")
+            return
+        self.log(f"6221: setting current to {ua:g} uA")
+        self.source_command(("current", ua * 1e-6))
+
+    def toggle_source_output(self):
+        if self.source is None:
+            return
+        want_on = not self.out_on
+        self.log("6221: output " + ("ON" if want_on else "OFF"))
+        self.source_command(("output", want_on))
+
+    def source_command(self, action):
+        for b in self.src_buttons:               # no double clicks while busy
+            b.config(state="disabled")
+        threading.Thread(target=self.source_worker, args=(action,),
+                         daemon=True).start()
+
+    def source_worker(self, action):
+        """Sends one command, then reads back what the 6221 really does."""
+        try:
+            with self.source_lock:
+                src = self.source
+                if action[0] == "current":
+                    src.write(f":SOUR:CURR {action[1]:.9g}")
+                else:
+                    src.write(":OUTP ON" if action[1] else ":OUTP OFF")
+                err = src.query(":SYST:ERR?").strip()
+                amps = float(src.query(":SOUR:CURR?"))
+                on = self.parse_on(src.query(":OUTP?"))
+            if not err.startswith("0"):
+                self.q.put(f"6221 error: {err}")
+            self.q.put(("src_state", amps, on))
+        except Exception as e:
+            self.q.put(f"6221 error: {e}")
+            self.q.put(("src_state", None, None))
+
+    def show_source_state(self, amps, on):
+        """amps/on are what the 6221 reported (None = unknown, keep as is)."""
+        if on is not None:
+            self.out_on = on
+        if amps is not None:
+            self.cur_var.set(f"{amps * 1e6:g}")
+        if self.source is None:
+            return
+        shown = self.cur_var.get().strip() or "?"
+        if self.out_on:
+            self.out_label.config(text=f"Output ON  ({shown} uA)", foreground="#c9302c")
+            self.out_btn.config(text="Turn OFF")
+        else:
+            self.out_label.config(text=f"Output OFF ({shown} uA set)", foreground="")
+            self.out_btn.config(text="Turn ON")
+        for b in self.src_buttons:
+            b.config(state="normal")
+
     # ---------- voltage measurement ----------
     def toggle_measure(self):
         if self.measuring:
@@ -800,10 +957,15 @@ class App:
             return
 
         addr_v = self.gpib_v_var.get().strip()
-        addr_c = self.gpib_c_var.get().strip()
         with_6221 = self.use_6221_var.get()
-        if not addr_v or (with_6221 and not addr_c):
-            messagebox.showwarning("Missing address", "Enter the GPIB address.")
+        if not addr_v:
+            messagebox.showwarning("Missing address", "Enter the 2182A GPIB address.")
+            return
+        if with_6221 and self.source is None:
+            messagebox.showwarning(
+                "6221 not connected",
+                "Connect the 6221 first (Current source panel), "
+                "or untick 'Also read 6221 current'.")
             return
 
         self.times, self.voltages, self.currents = [], [], []
@@ -821,27 +983,23 @@ class App:
         else:
             self.log("Measurement started (not saving data).")
         threading.Thread(target=self.measure_worker,
-                         args=(addr_v, addr_c, with_6221, interval, filename),
+                         args=(addr_v, with_6221, interval, filename),
                          daemon=True).start()
 
-    def measure_worker(self, addr_v, addr_c, with_6221, interval, filename):
+    def measure_worker(self, addr_v, with_6221, interval, filename):
         """Talks to the instruments in the background (GPIB can be slow)."""
-        rm = nano = source = csv_file = None
+        rm = nano = csv_file = None
+        source = self.source if with_6221 else None   # shared session, not closed here
         try:
-            rm = pyvisa.ResourceManager()
+            if self.rm is None:
+                self.rm = pyvisa.ResourceManager()
+            rm = self.rm
 
             nano = rm.open_resource(addr_v)
             nano.timeout = 10000
             nano.read_termination = "\n"
             nano.write_termination = "\n"
             self.mq.put(("log", "2182A: " + nano.query("*IDN?").strip()))
-
-            if with_6221:
-                source = rm.open_resource(addr_c)
-                source.timeout = 5000
-                source.read_termination = "\n"
-                source.write_termination = "\n"
-                self.mq.put(("log", "6221: " + source.query("*IDN?").strip()))
 
             nano.write(':SENS:FUNC "VOLT"')
 
@@ -863,7 +1021,10 @@ class App:
 
                 current_ua = None
                 if source is not None:
-                    current = float(source.query(":SOUR:CURR?"))
+                    with self.source_lock:
+                        on = self.parse_on(source.query(":OUTP?"))
+                        # output OFF = no current flows, whatever the setpoint is
+                        current = float(source.query(":SOUR:CURR?")) if on else 0.0
                     current_ua = current * 1e6
                     row += [current, current_ua]
 
@@ -884,7 +1045,7 @@ class App:
         except Exception as e:
             self.mq.put(("log", f"Measurement error: {e}"))
         finally:
-            for obj in (csv_file, nano, source, rm):
+            for obj in (csv_file, nano):
                 try:
                     if obj is not None:
                         obj.close()
@@ -920,6 +1081,15 @@ class App:
                     pos_changed = True
                 elif kind == "threshold":            # ("threshold", n, confirmed)
                     self.show_threshold(item[1], update_entry=item[2])
+                elif kind == "src_connected":        # ("src_connected", idn, amps, on)
+                    self.log("6221: " + item[1])
+                    self.src_conn_btn.config(text="Disconnect", state="normal")
+                    self.show_source_state(item[2], item[3])
+                elif kind == "src_failed":
+                    self.log(item[1])
+                    self.src_conn_btn.config(text="Connect", state="normal")
+                elif kind == "src_state":            # ("src_state", amps, on)
+                    self.show_source_state(item[1], item[2])
                 elif kind == "progress":
                     self.prog_label.config(text=item[1])
                 elif kind == "program_done":
@@ -970,6 +1140,11 @@ class App:
         self.running = False
         self.prog_abort.set()
         self.meas_stop.set()
+        if self.source is not None:        # close the session; output stays as it is
+            try:
+                self.source.close()
+            except Exception:
+                pass
         if self.ser:
             try:
                 self.ser.write(b"W 0\n")

@@ -6,9 +6,15 @@ Run:            python motor_voltage_control.py
 
 Close the Arduino Serial Monitor first (only one program can use the port).
 
-Left side : motor controls, voltage measurement settings, status log.
-Right side: live plot (voltage from the Keithley 2182A, optionally the
-            output current of the Keithley 6221 in a second plot).
+Left side : motor controls, optical sensor settings, voltage measurement
+            settings, status log.
+Right side: top plot    = voltage from the Keithley 2182A (optionally the
+                          output current of the 6221 in a second panel)
+            bottom plot = live analog value of the optical sensor, with the
+                          threshold drawn as a dashed line.
+
+Needs the matching Arduino sketch (motor_control.ino), which sends the raw
+sensor value when it receives the "W 1" command.
 If "Save data to CSV file" is ticked, each measurement is saved to a CSV file
 (measurement_YYYYMMDD_HHMMSS.csv) in the folder you run the script from.
 
@@ -18,9 +24,11 @@ one alone, or both at the same time.
 
 import csv
 import queue
+import re
 import threading
 import time
 import tkinter as tk
+from collections import deque
 from datetime import datetime
 from tkinter import ttk, messagebox
 
@@ -40,6 +48,7 @@ BAUD = 9600
 DEFAULT_GPIB_2182A = "GPIB0::17::INSTR"
 DEFAULT_GPIB_6221 = "GPIB0::11::INSTR"
 DEFAULT_INTERVAL = 0.5       # seconds between readings
+SENSOR_WINDOW_S = 30         # seconds of sensor signal shown in the plot
 # --------------------------------------------------------
 
 
@@ -59,6 +68,11 @@ class App:
         self.measuring = False
         self.meas_stop = threading.Event()
         self.times, self.voltages, self.currents = [], [], []
+
+        # optical sensor state
+        self.sensor_t = deque()
+        self.sensor_v = deque()
+        self.sensor_t0 = None
 
         pad = {"padx": 8, "pady": 6}
 
@@ -109,6 +123,30 @@ class App:
                                   state="disabled")
         self.stop_btn.pack(fill="x", **pad)
 
+        # =================== OPTICAL SENSOR ===================
+        sens = ttk.LabelFrame(left, text="Optical sensor (analog)")
+        sens.pack(fill="x", pady=(8, 0))
+
+        s1 = ttk.Frame(sens)
+        s1.pack(fill="x", **pad)
+        self.stream_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(s1, text="Plot sensor signal",
+                        variable=self.stream_var,
+                        command=self.toggle_stream).pack(side="left")
+        self.sensor_label = ttk.Label(s1, text="Value: --")
+        self.sensor_label.pack(side="right")
+
+        s2 = ttk.Frame(sens)
+        s2.pack(fill="x", **pad)
+        ttk.Label(s2, text="Threshold (0-1023):").pack(side="left")
+        self.thr_var = tk.StringVar(value="512")
+        self.thr_entry = ttk.Entry(s2, textvariable=self.thr_var, width=7)
+        self.thr_entry.pack(side="left", padx=6)
+        thr_btn = ttk.Button(s2, text="Set", command=self.set_threshold,
+                             state="disabled")
+        thr_btn.pack(side="left")
+        self.buttons.append(thr_btn)
+
         # =================== VOLTAGE ===================
         volt = ttk.LabelFrame(left, text="Voltage measurement")
         volt.pack(fill="x", pady=(8, 0))
@@ -149,14 +187,21 @@ class App:
 
         # =================== STATUS ===================
         ttk.Label(left, text="Status:").pack(anchor="w", pady=(8, 0))
-        self.status = tk.Text(left, height=10, width=44, state="disabled")
+        self.status = tk.Text(left, height=8, width=44, state="disabled")
         self.status.pack(fill="both", expand=True)
 
-        # =================== PLOT ===================
-        self.fig = Figure(figsize=(7, 5), dpi=100, layout="tight")
+        # =================== PLOTS ===================
+        # top: voltage (and 6221 current)
+        self.fig = Figure(figsize=(7, 4), dpi=100, layout="tight")
         self.canvas = FigureCanvasTkAgg(self.fig, master=right)
-        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.canvas.get_tk_widget().pack(side="top", fill="both", expand=True)
         self.setup_axes(False)
+
+        # bottom: optical sensor signal
+        self.sfig = Figure(figsize=(7, 2.6), dpi=100, layout="tight")
+        self.scanvas = FigureCanvasTkAgg(self.sfig, master=right)
+        self.scanvas.get_tk_widget().pack(side="top", fill="both", expand=True)
+        self.setup_sensor_axes()
 
         if pyvisa is None:
             self.meas_btn.config(state="disabled")
@@ -215,21 +260,24 @@ class App:
                          daemon=True).start()
 
     def handshake(self, ser):
-        """Background check: send '?' and wait up to 2 s for BLOCKED/FREE."""
+        """Background check: send '?' and wait up to 2 s for BLOCKED/FREE.
+        The reply looks like 'FREE value=123 threshold=512'."""
         ok = False
+        reply = ""
         try:
             ser.write(b"?\n")
             deadline = time.time() + 2.0
             while time.time() < deadline:
                 line = ser.readline().decode(errors="ignore").strip()
-                if line in ("BLOCKED", "FREE"):
+                if line.startswith(("BLOCKED", "FREE")):
                     ok = True
+                    reply = line
                     break
         except (serial.SerialException, OSError):
             pass
-        self.q.put(("handshake", ok))
+        self.q.put(("handshake", ok, reply))
 
-    def handshake_done(self, ok):
+    def handshake_done(self, ok, reply=""):
         if not ok:
             port = self.port_var.get()
             try:
@@ -249,10 +297,24 @@ class App:
         self.conn_btn.config(text="Disconnect", state="normal")
         self.set_enabled(True)
         self.log("Connected.")
+        self.log("Arduino: " + reply)
+
+        # start a fresh sensor plot, show the Arduino's threshold, start streaming
+        self.clear_sensor_data()
+        thr = self.find_threshold(reply)
+        if thr is not None:
+            self.show_threshold(thr, update_entry=True)
+        if self.stream_var.get():
+            self.send("W 1")
 
     def disconnect(self):
         self.running = False
         self.set_enabled(False)
+        if self.ser:
+            try:                           # best effort: stop the stream
+                self.ser.write(b"W 0\n")
+            except Exception:
+                pass
         time.sleep(0.3)
         if self.ser:
             self.ser.close()
@@ -270,8 +332,23 @@ class App:
                 self.q.put("Connection lost.")
                 self.running = False
                 return
-            if line:
-                self.q.put("Arduino: " + line)
+            if not line:
+                continue
+            if line.startswith("A "):                 # streamed sensor value
+                try:
+                    self.q.put(("sensor", time.perf_counter(), int(line[2:])))
+                except ValueError:
+                    pass
+                continue
+            thr = self.find_threshold(line)           # "THRESHOLD 400" or "...threshold=400"
+            if thr is not None:
+                self.q.put(("threshold", thr, line.startswith("THRESHOLD")))
+            self.q.put("Arduino: " + line)
+
+    @staticmethod
+    def find_threshold(line):
+        m = re.search(r"threshold[= ](\d+)", line, re.IGNORECASE)
+        return int(m.group(1)) if m else None
 
     def send(self, text):
         if not self.ser:
@@ -309,6 +386,67 @@ class App:
 
     def stop(self):
         self.send("S")
+
+    # ---------- optical sensor ----------
+    def toggle_stream(self):
+        self.send("W 1" if self.stream_var.get() else "W 0")
+
+    def set_threshold(self):
+        try:
+            n = int(float(self.thr_var.get()))
+        except ValueError:
+            messagebox.showwarning("Bad threshold", "Enter a number from 0 to 1023.")
+            return
+        if not 0 <= n <= 1023:
+            messagebox.showwarning("Bad threshold", "The value must be from 0 to 1023.")
+            return
+        self.send(f"T {n}")
+
+    def show_threshold(self, n, update_entry):
+        """Draw the threshold line; the Arduino's value is the one that counts."""
+        self.sthr.set_ydata([n, n])
+        self.sthr.set_visible(True)
+        self.scanvas.draw_idle()
+        # don't overwrite what the user is typing
+        try:
+            typing = self.root.focus_get() is self.thr_entry
+        except KeyError:
+            typing = False
+        if update_entry or not typing:
+            self.thr_var.set(str(n))
+
+    def clear_sensor_data(self):
+        self.sensor_t.clear()
+        self.sensor_v.clear()
+        self.sensor_t0 = None
+        self.sline.set_data([], [])
+        self.sax.set_xlim(0, SENSOR_WINDOW_S)
+        self.sensor_label.config(text="Value: --")
+        self.scanvas.draw_idle()
+
+    def setup_sensor_axes(self):
+        self.sax = self.sfig.add_subplot(111)
+        self.sline, = self.sax.plot([], [], "-", linewidth=1.2)
+        self.sthr = self.sax.axhline(0, linestyle="--", linewidth=1,
+                                     color="tab:red", visible=False)
+        self.sax.set_title("Optical sensor - analog value (dashed = threshold)")
+        self.sax.set_xlabel("Time (s)")
+        self.sax.set_ylabel("ADC value (0-1023)")
+        self.sax.set_ylim(0, 1023)
+        self.sax.set_xlim(0, SENSOR_WINDOW_S)
+        self.sax.grid(True, alpha=0.3)
+        self.scanvas.draw_idle()
+
+    def update_sensor_plot(self):
+        if not self.sensor_t:
+            return
+        t = self.sensor_t[-1]
+        while self.sensor_t and self.sensor_t[0] < t - SENSOR_WINDOW_S:
+            self.sensor_t.popleft()
+            self.sensor_v.popleft()
+        self.sline.set_data(list(self.sensor_t), list(self.sensor_v))
+        self.sax.set_xlim(max(0, t - SENSOR_WINDOW_S), max(SENSOR_WINDOW_S, t))
+        self.scanvas.draw_idle()
 
     # ---------- plot ----------
     def setup_axes(self, with_6221):
@@ -454,16 +592,31 @@ class App:
 
     # ---------- GUI update loop ----------
     def poll_queue(self):
-        # motor messages
+        # motor / sensor messages
+        sensor_updated = False
         try:
             while True:
                 item = self.q.get_nowait()
-                if isinstance(item, tuple):          # ("handshake", ok)
-                    self.handshake_done(item[1])
-                else:
+                if not isinstance(item, tuple):
                     self.log(item)
+                    continue
+                kind = item[0]
+                if kind == "handshake":              # ("handshake", ok, reply)
+                    self.handshake_done(item[1], item[2])
+                elif kind == "sensor":               # ("sensor", time, value)
+                    _, ts, value = item
+                    if self.sensor_t0 is None:
+                        self.sensor_t0 = ts
+                    self.sensor_t.append(ts - self.sensor_t0)
+                    self.sensor_v.append(value)
+                    self.sensor_label.config(text=f"Value: {value}")
+                    sensor_updated = True
+                elif kind == "threshold":            # ("threshold", n, confirmed)
+                    self.show_threshold(item[1], update_entry=item[2])
         except queue.Empty:
             pass
+        if sensor_updated:
+            self.update_sensor_plot()
 
         # measurement messages
         updated = False
@@ -500,6 +653,7 @@ class App:
         self.meas_stop.set()
         if self.ser:
             try:
+                self.ser.write(b"W 0\n")
                 self.ser.close()
             except Exception:
                 pass

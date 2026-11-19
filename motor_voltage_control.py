@@ -70,9 +70,12 @@ DEFAULT_INTERVAL = 0.5       # seconds between readings
 SENSOR_WINDOW_S = 30         # seconds of sensor signal shown in the plot
 MIN_SPEED = 20               # steps per second (same limits as the Arduino)
 MAX_SPEED = 3000
-MAX_POS = 10_000_000
+STROKE_MM = 19.1             # total travel of the actuator (datasheet)
 MAX_CURRENT_UA = 105_000     # 6221 limit: 105 mA
-UM_PER_STEP = 5.0            # micrometres per motor step = lead / (steps per rev x microsteps)
+UM_PER_STEP = 0.625          # micrometres per step = 5 um full step / 8 (1/8 microstepping;
+                             # measured: 8000 steps = 5 mm)
+CAL_MAX_STEPS = 10_000       # must match CAL_MAX_STEPS in the Arduino sketch
+MAX_POS = int(STROKE_MM * 1000 / UM_PER_STEP)   # whole stroke, in steps (38200)
 CAL_TIMEOUT_S = 180          # give up waiting for a calibration after this long
 # --------------------------------------------------------
 
@@ -800,8 +803,9 @@ class App:
                 "The motor will move down until the sensor is free, then up past "
                 "the edge until the beam is fully blocked, then back down and "
                 "home again.\n\n"
-                "Each move is limited to 2000 steps (CAL_MAX_STEPS in the Arduino "
-                "sketch). Make sure there is free travel in both directions.\n\n"
+                f"Each move is limited to {CAL_MAX_STEPS} steps "
+                f"({self.steps_to_mm(CAL_MAX_STEPS):g} mm). "
+                "Make sure there is free travel in both directions.\n\n"
                 "Continue?"):
             return
         self.start_program([("calibrate",)], "Calibration")

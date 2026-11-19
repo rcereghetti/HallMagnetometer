@@ -4,7 +4,7 @@ const int DIR_PIN    = 5;    // CNC shield X direction
 const int EN_PIN     = 8;    // CNC shield enable (LOW = on)
 const int SENSOR_PIN = A0;   // optical sensor (analog)
 
-const bool UP_DIR = HIGH;    // flip to LOW if "up" goes the wrong way
+const bool UP_DIR = LOW;    // flip to LOW if "up" goes the wrong way
 
 // With the wiring described (resistor from 5 V to the phototransistor
 // collector, A0 on that point), a BLOCKED beam gives a HIGH reading.
@@ -17,6 +17,15 @@ const long MIN_SPEED = 20;   // steps per second (limits of the "V" command)
 const long MAX_SPEED = 3000;
 
 const unsigned long STREAM_MS = 50;   // time between streamed sensor values
+
+// Calibration ("C" command): finds the free level and the blocked level of the
+// sensor and sets the threshold exactly in the middle, then homes again.
+const long CAL_SPEED        = 500;   // steps per second during the calibration scans
+const long CAL_MAX_STEPS    = 2000;  // safety limit for each scan (see the notes in the chat)
+const int  CAL_WINDOW       = 50;    // steps used to decide "the reading is flat"
+const int  CAL_FLAT         = 8;     // max spread (ADC counts) in that window to count as flat
+const int  CAL_MIN_CONTRAST = 100;   // free and blocked levels must differ by at least this
+const long CAL_BACKOFF      = 200;   // steps below the edge before the final home
 // --------------------------------------------------------
 
 // Position = motor steps BELOW the home sensor (0 = sensor, grows going down).
@@ -90,16 +99,17 @@ bool handleSetting(String cmd) {
 }
 
 // Moves the motor 'steps' steps. Updates pos on every step.
-// Moving up always stops at the sensor (safety) and sets pos = 0.
+// Moving up stops at the sensor (safety) and sets pos = 0, unless
+// stopAtSensor is false (only the calibration does that).
 // 'S' stops any move. Steps are spaced exactly stepPeriodUs apart.
-int moveSteps(long steps, bool up) {
+int moveSteps(long steps, bool up, bool stopAtSensor) {
   digitalWrite(DIR_PIN, up ? UP_DIR : !UP_DIR);
   delayMicroseconds(10);
   for (long i = 0; i < steps; i++) {
     unsigned long t0 = micros();
     unsigned long period = stepPeriodUs;
 
-    if (up && sensorHit()) {
+    if (up && stopAtSensor && sensorHit()) {
       pos = 0;
       homed = true;
       return MOVE_SENSOR;
@@ -142,6 +152,97 @@ void reportMove(int r, bool isHome) {
   Serial.println(pos);
 }
 
+// ---------- Calibration ----------
+// Sensor value averaged over 4 readings (less noise).
+int avgSensor() {
+  long sum = 0;
+  for (int i = 0; i < 4; i++) sum += analogRead(SENSOR_PIN);
+  return (int)(sum / 4);
+}
+
+bool isBlockedValue(int v) {
+  return BLOCKED_IS_HIGH ? (v > threshold) : (v < threshold);
+}
+
+// Moves one step at a time (up or down) until the reading is flat AND on the
+// wanted side of the current threshold (wantBlocked = true: blocked plateau,
+// false: free plateau). The mean of that flat stretch is returned in 'level'.
+// Returns 0 = found, 1 = not found within CAL_MAX_STEPS, 2 = stopped by 'S'.
+int scanForPlateau(bool up, bool wantBlocked, int &level) {
+  int wmin = 1023, wmax = 0, wn = 0;
+  long wsum = 0;
+  long steps = 0, afterCross = 0;
+  bool crossed = false;                 // reading has been on the wanted side
+  while (true) {
+    int v = avgSensor();
+    if (isBlockedValue(v) == wantBlocked) crossed = true;
+    if (v < wmin) wmin = v;
+    if (v > wmax) wmax = v;
+    wsum += v;
+    wn++;
+    if (wn >= CAL_WINDOW) {
+      if (wmax - wmin <= CAL_FLAT) {
+        int mean = (int)(wsum / wn);
+        if (isBlockedValue(mean) == wantBlocked) {
+          level = mean;
+          return 0;
+        }
+      }
+      wmin = 1023; wmax = 0; wn = 0; wsum = 0;
+    }
+    if (crossed ? (afterCross >= CAL_MAX_STEPS) : (steps >= CAL_MAX_STEPS)) return 1;
+    if (moveSteps(1, up, false) == MOVE_STOPPED) return 2;
+    steps++;
+    if (crossed) afterCross++;
+  }
+}
+
+// 0 = done (ready for the final home), 1 = plateau not found, 2 = stopped,
+// 3 = free and blocked levels too close together, 4 = could not come back down.
+int calibrateRun() {
+  int freeLevel = 0, blockedLevel = 0;
+  int r = scanForPlateau(false, false, freeLevel);     // down to the free plateau
+  if (r != 0) return r;
+  r = scanForPlateau(true, true, blockedLevel);        // up, through the edge, to the blocked plateau
+  if (r != 0) return r;
+
+  int contrast = BLOCKED_IS_HIGH ? (blockedLevel - freeLevel) : (freeLevel - blockedLevel);
+  if (contrast < CAL_MIN_CONTRAST) return 3;
+
+  threshold = (freeLevel + blockedLevel) / 2;
+  Serial.print("CAL free=");
+  Serial.print(freeLevel);
+  Serial.print(" blocked=");
+  Serial.print(blockedLevel);
+  Serial.print(" threshold=");
+  Serial.println(threshold);
+  Serial.print("THRESHOLD ");
+  Serial.println(threshold);
+
+  // come back down below the edge, so the final home approaches from below
+  long n = 0;
+  while (isBlockedValue(avgSensor())) {
+    if (n >= 2 * CAL_MAX_STEPS) return 4;
+    if (moveSteps(1, false, false) == MOVE_STOPPED) return 2;
+    n++;
+  }
+  if (moveSteps(CAL_BACKOFF, false, false) == MOVE_STOPPED) return 2;
+  return 0;
+}
+
+void calibrate() {
+  unsigned long oldPeriod = stepPeriodUs;
+  stepPeriodUs = 1000000UL / CAL_SPEED;
+  Serial.println("CAL started");
+  int r = calibrateRun();
+  stepPeriodUs = oldPeriod;                            // back to the normal speed
+  if (r == 0) reportMove(moveSteps(2000000L, true, true), true);   // final home: pos = 0
+  else if (r == 2) reportMove(MOVE_STOPPED, false);
+  else if (r == 1) Serial.println("ERR CAL plateau not found");
+  else if (r == 3) Serial.println("ERR CAL contrast too small");
+  else Serial.println("ERR CAL could not come back down");
+}
+
 void setup() {
   pinMode(STEP_PIN, OUTPUT);
   pinMode(DIR_PIN, OUTPUT);
@@ -170,12 +271,12 @@ void loop() {
       homed = true;
       Serial.println("HOMED pos=0");
     } else {
-      reportMove(moveSteps(2000000L, true), true);
+      reportMove(moveSteps(2000000L, true, true), true);
     }
   }
   else if (c == 'M') {                  // "M 200" = 200 steps up, "M -200" = down
     long n = cmd.substring(1).toInt();
-    reportMove(moveSteps(abs(n), n > 0), false);
+    reportMove(moveSteps(abs(n), n > 0, true), false);
   }
   else if (c == 'G') {                  // "G 1500" = go to position 1500 (needs homing first)
     long target = cmd.substring(1).toInt();
@@ -185,8 +286,11 @@ void loop() {
       Serial.println("ERR RANGE");
     } else {
       long d = target - pos;            // d < 0 means up
-      reportMove(moveSteps(abs(d), d < 0), false);
+      reportMove(moveSteps(abs(d), d < 0, true), false);
     }
+  }
+  else if (c == 'C') {                  // CALIBRATE: threshold = middle of the edge, then home
+    calibrate();
   }
   else if (c == '?') {                  // report sensor state, raw value, position
     int v = analogRead(SENSOR_PIN);

@@ -25,6 +25,16 @@ Sweep / stop-and-go
   Stop and go      : go to Start, then move toward End in jumps of "Stop every"
                      steps, waiting "Wait at each stop" seconds at every stop
                      (the first stop is Start, the last one is always End).
+  Fields that are in steps (or steps/s) show the matching length in mm next
+  to them, using UM_PER_STEP below (check that value for your actuator and
+  driver microstepping!).
+
+Calibrate home
+  The button in the sensor panel lets the motor find the "free" level and the
+  "blocked" level of the optical sensor, puts the threshold exactly halfway
+  between them, and homes again from below. Position 0 is then the middle of
+  the sensor edge. Needs the matching Arduino sketch (command "C").
+
   The voltage measurement is independent: start it first, then run the
   program. Each CSV row also gets the motor position and the stop number
   (empty while the motor is moving). Keep "Plot sensor signal" ticked if you
@@ -62,6 +72,8 @@ MIN_SPEED = 20               # steps per second (same limits as the Arduino)
 MAX_SPEED = 3000
 MAX_POS = 10_000_000
 MAX_CURRENT_UA = 105_000     # 6221 limit: 105 mA
+UM_PER_STEP = 5.0            # micrometres per motor step = lead / (steps per rev x microsteps)
+CAL_TIMEOUT_S = 180          # give up waiting for a calibration after this long
 # --------------------------------------------------------
 
 
@@ -133,6 +145,9 @@ class App:
         ttk.Label(mid, text="Amount (steps):").pack(side="left")
         self.amount_var = tk.StringVar(value="200")
         ttk.Entry(mid, textvariable=self.amount_var, width=10).pack(side="left", padx=6)
+        amount_mm = ttk.Label(mid, text="")
+        amount_mm.pack(side="left")
+        self.link_units(self.amount_var, amount_mm)
 
         # --- Buttons ---
         btns = ttk.Frame(motor)
@@ -176,6 +191,13 @@ class App:
                              state="disabled")
         thr_btn.pack(side="left")
         self.buttons.append(thr_btn)
+
+        s3 = ttk.Frame(sens)
+        s3.pack(fill="x", **pad)
+        cal_btn = ttk.Button(s3, text="Calibrate home (find midpoint)",
+                             command=self.calibrate_home, state="disabled")
+        cal_btn.pack(side="left")
+        self.buttons.append(cal_btn)
 
         # =================== 6221 CURRENT SOURCE ===================
         cur = ttk.LabelFrame(colA, text="Current source (Keithley 6221)")
@@ -236,12 +258,17 @@ class App:
         g.pack(fill="x", **pad)
         g.columnconfigure(1, weight=1)
 
-        def add_row(r, text, var, button=None):
+        def add_row(r, text, var, button=None, unit=None):
+            """unit: None = no conversion, "" = steps -> mm, "/s" = steps/s -> mm/s"""
             ttk.Label(g, text=text).grid(row=r, column=0, sticky="w", pady=2)
             ttk.Entry(g, textvariable=var, width=8).grid(
                 row=r, column=1, sticky="w", padx=6, pady=2)
+            if unit is not None:
+                lab = ttk.Label(g, text="", width=16)
+                lab.grid(row=r, column=2, sticky="w", pady=2)
+                self.link_units(var, lab, unit)
             if button is not None:
-                button.grid(row=r, column=2, sticky="e", pady=2)
+                button.grid(row=r, column=3, sticky="e", pady=2)
 
         use_start = ttk.Button(g, text="Use current", state="disabled",
                                command=lambda: self.use_current(self.start_var))
@@ -249,12 +276,18 @@ class App:
                              command=lambda: self.use_current(self.end_var))
         self.buttons += [use_start, use_end]
 
-        add_row(0, "Start position:", self.start_var, use_start)
-        add_row(1, "End position:", self.end_var, use_end)
-        add_row(2, "Jog/positioning speed (steps/s):", self.pspeed_var)
-        add_row(3, "Sweep speed (steps/s):", self.sspeed_var)
-        add_row(4, "Stop every (steps):", self.step_var)
+        add_row(0, "Start position (steps):", self.start_var, use_start, "")
+        add_row(1, "End position (steps):", self.end_var, use_end, "")
+        add_row(2, "Jog/positioning speed (steps/s):", self.pspeed_var, unit="/s")
+        add_row(3, "Sweep speed (steps/s):", self.sspeed_var, unit="/s")
+        add_row(4, "Stop every (steps):", self.step_var, unit="")
         add_row(5, "Wait at each stop (s):", self.dwell_var)
+
+        self.span_label = ttk.Label(sw, text="")
+        self.span_label.pack(anchor="w", padx=8)
+        self.start_var.trace_add("write", self.update_span)
+        self.end_var.trace_add("write", self.update_span)
+        self.update_span()
 
         m = ttk.Frame(sw)
         m.pack(fill="x", **pad)
@@ -352,12 +385,38 @@ class App:
         if ports and self.port_var.get() not in ports:
             self.port_var.set(ports[0])
 
+    @staticmethod
+    def steps_to_mm(n):
+        return n * UM_PER_STEP / 1000.0
+
+    def link_units(self, var, label, suffix=""):
+        """Keeps 'label' showing the length (mm, or mm/s) of the steps in 'var'."""
+        def update(*_):
+            try:
+                n = float(var.get())
+            except ValueError:
+                label.config(text="= ?")
+                return
+            label.config(text=f"= {self.steps_to_mm(n):.3f} mm{suffix}")
+        var.trace_add("write", update)
+        update()
+
+    def update_span(self, *_):
+        try:
+            d = abs(float(self.end_var.get()) - float(self.start_var.get()))
+        except ValueError:
+            self.span_label.config(text="Sweep length: ?")
+            return
+        self.span_label.config(
+            text=f"Sweep length: {d:g} steps = {self.steps_to_mm(d):.3f} mm")
+
     def update_pos_label(self):
         if self.position is None:
             text = "Position: --"
         else:
             state = "homed" if self.homed else "not homed"
-            text = f"Position: {self.position} steps ({state})"
+            text = (f"Position: {self.position} steps = "
+                    f"{self.steps_to_mm(self.position):.3f} mm ({state})")
         self.pos_label.config(text=text)
 
     # ---------- motor connection ----------
@@ -488,6 +547,10 @@ class App:
 
             if line.startswith("SPEED"):              # confirmation of "V", not interesting
                 continue
+
+            mc = re.search(r"CAL free=(\d+) blocked=(\d+)", line)
+            if mc:
+                self.q.put(("cal_levels", int(mc.group(1)), int(mc.group(2))))
 
             m = re.search(r"pos=(-?\d+)", line)
             if m:
@@ -670,6 +733,15 @@ class App:
                     if result != "ok":
                         msg = result
                         break
+                elif step[0] == "calibrate":
+                    self.stop_idx = None
+                    self.q.put(("progress",
+                                "Calibrating: the motor moves down, then up past the "
+                                "sensor edge, then homes again..."))
+                    result = self.calibrate()
+                    if result != "ok":
+                        msg = result
+                        break
                 else:
                     _, secs, k, n, p = step
                     self.stop_idx = k
@@ -719,6 +791,54 @@ class App:
                 return f"Arduino error: {line}"
         return "No answer from the Arduino (timeout)."
 
+    # ---------- calibration ----------
+    def calibrate_home(self):
+        if not self.ser or not self.running or self.prog_running:
+            return
+        if not messagebox.askokcancel(
+                "Calibrate home",
+                "The motor will move down until the sensor is free, then up past "
+                "the edge until the beam is fully blocked, then back down and "
+                "home again.\n\n"
+                "Each move is limited to 2000 steps (CAL_MAX_STEPS in the Arduino "
+                "sketch). Make sure there is free travel in both directions.\n\n"
+                "Continue?"):
+            return
+        self.start_program([("calibrate",)], "Calibration")
+
+    def calibrate(self):
+        """Sends 'C' and waits until the Arduino has finished (it ends with HOMED).
+        Returns 'ok' or a text describing what went wrong."""
+        while True:                          # forget old replies
+            try:
+                self.move_q.get_nowait()
+            except queue.Empty:
+                break
+        if not self.write_line("C"):
+            return "Send error."
+        deadline = time.time() + CAL_TIMEOUT_S
+        while time.time() < deadline:
+            if self.prog_abort.is_set():
+                return "Stopped."
+            try:
+                line = self.move_q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if line.startswith("HOMED"):
+                return "Calibration finished: home is now the middle of the edge."
+            if line.startswith("STOPPED"):
+                return "Stopped."
+            if line.startswith("ERR"):
+                return f"Calibration failed: {line}"
+        return "No answer from the Arduino (calibration timeout)."
+
+    def show_levels(self, free, blocked):
+        self.sfree.set_ydata([free, free])
+        self.sfree.set_visible(True)
+        self.sblock.set_ydata([blocked, blocked])
+        self.sblock.set_visible(True)
+        self.scanvas.draw_idle()
+
     # ---------- optical sensor ----------
     def toggle_stream(self):
         self.send("W 1" if self.stream_var.get() else "W 0")
@@ -761,7 +881,12 @@ class App:
         self.sline, = self.sax.plot([], [], "-", linewidth=1.2)
         self.sthr = self.sax.axhline(0, linestyle="--", linewidth=1,
                                      color="tab:red", visible=False)
-        self.sax.set_title("Optical sensor - analog value (dashed = threshold)")
+        self.sfree = self.sax.axhline(0, linestyle=":", linewidth=1,
+                                      color="tab:green", visible=False)
+        self.sblock = self.sax.axhline(0, linestyle=":", linewidth=1,
+                                       color="tab:orange", visible=False)
+        self.sax.set_title("Optical sensor - analog value "
+                           "(red dashed = threshold, dotted = free / blocked level)")
         self.sax.set_xlabel("Time (s)")
         self.sax.set_ylabel("ADC value (0-1023)")
         self.sax.set_ylim(0, 1023)
@@ -1010,7 +1135,7 @@ class App:
                 headers = ["Time (s)", "Voltage (V)", "Voltage (uV)"]
                 if with_6221:
                     headers += ["Current (A)", "Current (uA)"]
-                headers += ["Position (steps)", "Stop #"]
+                headers += ["Position (steps)", "Position (mm)", "Stop #"]
                 writer.writerow(headers)
 
             start = time.perf_counter()
@@ -1032,6 +1157,7 @@ class App:
                 position = self.position
                 stop_idx = self.stop_idx
                 row += [position if position is not None else "",
+                        self.steps_to_mm(position) if position is not None else "",
                         stop_idx if stop_idx is not None else ""]
 
                 if writer:
@@ -1081,6 +1207,8 @@ class App:
                     pos_changed = True
                 elif kind == "threshold":            # ("threshold", n, confirmed)
                     self.show_threshold(item[1], update_entry=item[2])
+                elif kind == "cal_levels":           # ("cal_levels", free, blocked)
+                    self.show_levels(item[1], item[2])
                 elif kind == "src_connected":        # ("src_connected", idn, amps, on)
                     self.log("6221: " + item[1])
                     self.src_conn_btn.config(text="Disconnect", state="normal")
